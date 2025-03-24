@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-![Demo Screenshot](dream-new-kilo/src/images/image.png)  
+![Demo Screenshot](src/images/image.png)  
 
-基于经典项目 [kilo](https://github.com/antirez/kilo) 的现代化再造，一个用纯 C 语言开发的轻量级终端文本编辑器。这是作者的第一个 C 语言系统级项目，致力于打造可学习、可扩展的编辑器开发范本。
+基于经典项目 [kilo](https://github.com/antirez/kilo) 的现代化再造，一个用纯 C 语言开发的轻量级终端文本编辑器。
 
 ## ✨ 特性亮点
 
