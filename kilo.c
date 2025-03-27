@@ -10,10 +10,16 @@
     g.turn off all output processing
     h.miscellaneous flags
 3. Raw input and output
+5. Implement text viewing
 4. 在结束时，退出 raw mode
 */
 
 /*** includes ***/
+
+// 特性测试宏，增加可移植性
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
 
 #include <ctype.h>
 #include <errno.h>
@@ -21,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -42,11 +49,32 @@ enum editorKey
 };
 
 /*** data ***/
+typedef struct erow
+{
+    int size;
+    char *chars;
+} erow;
+
 struct editorConfig
 {
+    // 光标位置
     int cx, cy;
+    // 行偏移量
+    int rowoff;
     int screenrows;
     int screencols;
+
+    // 文件缓冲区行数
+    int numrows;
+
+    /*
+    1. erow *row 是一个指针，不是数组本身
+    2. 通过 malloc/realloc 分配连续内存后，它可以模拟数组行为
+    3. 这种设计是动态数组在 C 语言中的经典实现方式
+    */
+    // 行数组
+    erow *row;
+
     // termios是终端属性结构体
     struct termios orig_termios;
 };
@@ -228,6 +256,46 @@ int getWindowSize(int *rows, int *cols)
     }
 }
 
+/*** row operations ***/
+void editorAppendRow(char *s, size_t len)
+{
+    E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+    int at = E.numrows;
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+    E.numrows++;
+}
+
+/*** file i/o ***/
+void editorOpen(char *filename)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp)
+    {
+        die("fopen");
+    }
+    // 读取文件内容到编辑器缓冲区
+    char *line = NULL;
+    // 每行的容量
+    size_t linecap = 0;
+    // 读取到的行的长度
+    ssize_t linelen;
+    while ((linelen = getline(&line, &linecap, fp)) != -1)
+    {
+        while (linelen > 0 && (line[linelen - 1] == '\n' ||
+                               line[linelen - 1] == '\r'))
+        {
+            linelen--;
+        }
+        editorAppendRow(line, linelen);
+    }
+    free(line);
+    fclose(fp);
+}
+
 /*** append buffer ***/
 struct abuf
 {
@@ -254,36 +322,60 @@ void abFree(struct abuf *ab)
 }
 
 /*** output ***/
+void editorScroll()
+{
+    if (E.cy < E.rowoff)
+    {
+        E.rowoff = E.cy;
+    }
+    if (E.cy >= E.rowoff + E.screenrows)
+    {
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+}
+
 void editorDrawRows(struct abuf *ab)
 {
     int y;
     for (y = 0; y < E.screenrows; y++)
     {
-        if (y == E.screenrows / 3)
+        int filerow = y + E.rowoff;
+        if (filerow >= E.numrows)
         {
-            // 将欢迎信息输入到缓冲区
-            char welcome[80];
-            int welcomelen = snprintf(welcome, sizeof(welcome),
-                                      "DreamKilo editor -- version %s", KILO_VERSION);
-            if (welcomelen > E.screencols)
-                welcomelen = E.screencols;
+            if (E.numrows == 0 && y == E.screenrows / 3)
+            {
+                // 将欢迎信息输入到缓冲区
+                char welcome[80];
+                int welcomelen = snprintf(welcome, sizeof(welcome),
+                                          "DreamKilo editor -- version %s", KILO_VERSION);
+                if (welcomelen > E.screencols)
+                    welcomelen = E.screencols;
 
-            // 将欢迎信息居中
-            int padding = (E.screencols - welcomelen) / 2;
-            if (padding)
+                // 将欢迎信息居中
+                int padding = (E.screencols - welcomelen) / 2;
+                if (padding)
+                {
+                    abAppend(ab, "~", 1);
+                    padding--;
+                }
+                while (padding--)
+                    abAppend(ab, " ", 1);
+                abAppend(ab, welcome, welcomelen);
+            }
+            else
             {
                 abAppend(ab, "~", 1);
-                padding--;
             }
-            while (padding--)
-                abAppend(ab, " ", 1);
-            abAppend(ab, welcome, welcomelen);
         }
         else
         {
-            abAppend(ab, "~", 1);
+            int len = E.row[filerow].size;
+            if (len > E.screencols)
+                len = E.screencols;
+            abAppend(ab, E.row[filerow].chars, len);
         }
 
+        // 擦除当前行中的部分内容
         abAppend(ab, "\x1b[K", 3);
         if (y < E.screenrows - 1)
         {
@@ -294,19 +386,30 @@ void editorDrawRows(struct abuf *ab)
 
 void editorRefreshScreen()
 {
+    // 调整行偏移量的位置
+    editorScroll();
+
     struct abuf ab = ABUF_INIT;
 
+    // 1. 隐藏光标：防止屏幕刷新时的光标闪烁
     abAppend(&ab, "\x1b[?25l", 6);
+    // 2. 将光标定位到终端左上角(1,1)，准备重绘界面
     abAppend(&ab, "\x1b[H", 3);
 
+    // 3. 绘制所有文本行和编辑器界面元素到缓冲区
     editorDrawRows(&ab);
 
+    /* 4. 准备光标定位转义序列：
+       - 终端坐标系从(1,1)开始，编辑器内部从(0,0)存储
+       - 生成类似\e[24;80H的字符串定位光标 */
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, E.cx + 1);
     abAppend(&ab, buf, strlen(buf));
 
+    // 5. 重新显示光标
     abAppend(&ab, "\x1b[?25h", 6);
 
+    // 6. 将构建好的缓冲区内容一次性写入终端，确保原子性显示
     write(STDOUT_FILENO, ab.b, ab.len);
     abFree(&ab);
 }
@@ -335,7 +438,7 @@ void editorMoveCursor(int key)
         }
         break;
     case ARROW_DOWN:
-        if (E.cy != E.screenrows - 1)
+        if (E.cy < E.numrows)
         {
             E.cy++;
         }
@@ -385,18 +488,31 @@ void initEditor()
 {
     E.cx = 0;
     E.cy = 0;
+    E.rowoff = 0;
+    E.numrows = 0;
+    E.row = NULL;
+
     if (getWindowSize(&E.screenrows, &E.screencols) == -1)
         die("getWindowSize");
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    // 进入 raw mode
     enableRawMode();
+    // 初始化编辑器
     initEditor();
+    // 打开文件
+    if (argc >= 2)
+    {
+        editorOpen(argv[1]);
+    }
 
     while (1)
     {
+        // 刷新屏幕
         editorRefreshScreen();
+        // 处理输入
         editorProcessKeypress();
     }
 
