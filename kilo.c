@@ -12,6 +12,11 @@
 3. Raw input and output
 5. Implement text viewing
 4. 在结束时，退出 raw mode
+
+BUG-TODO:
+    1. 光标位置不准确，原因未知
+    2. 有乱码情况
+    3. 有行列数偏差情况，会在按下方向键时提前换行（可能是当前行列数不准确，唉，真烦）[好像是测试文件的问题，copy]
 */
 
 /*** includes ***/
@@ -24,15 +29,19 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /*** defines ***/
 #define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 8
+
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey
@@ -52,15 +61,20 @@ enum editorKey
 typedef struct erow
 {
     int size;
+    int rsize;
     char *chars;
+    char *render;
 } erow;
 
 struct editorConfig
 {
     // 光标位置
     int cx, cy;
-    // 行偏移量
+    int rx;
+    // 行，列偏移量
     int rowoff;
+    int coloff;
+
     int screenrows;
     int screencols;
 
@@ -74,6 +88,10 @@ struct editorConfig
     */
     // 行数组
     erow *row;
+    char *filename;
+    // 消息及时间戳
+    char statusmsg[80];
+    time_t statusmsg_time;
 
     // termios是终端属性结构体
     struct termios orig_termios;
@@ -257,6 +275,56 @@ int getWindowSize(int *rows, int *cols)
 }
 
 /*** row operations ***/
+int editorRowCxToRx(erow *row, int cx)
+{
+    int rx = 0;
+    int j;
+    for (j = 0; j < cx; j++)
+    {
+        if (row->chars[j] == '\t')
+            rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+        rx++;
+    }
+    return rx;
+}
+
+void editorUpdateRow(erow *row)
+{
+    // 统计tabs， 开辟缓存空间
+    int tabs = 0;
+    int j;
+    for (j = 0; j < row->size; j++)
+    {
+        if (row->chars[j] == '\t')
+        {
+            tabs++;
+        }
+    }
+
+    free(row->render);
+    row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) + 1);
+
+    // 复制字符到渲染缓存中，替换tab为8个空格
+    int idx = 0;
+    for (j = 0; j < row->size; j++)
+    {
+        if (row->chars[j] == '\t')
+        {
+            row->render[idx++] = ' ';
+            while (idx % KILO_TAB_STOP != 0)
+            {
+                row->render[idx++] = ' ';
+            }
+        }
+        else
+        {
+            row->render[idx++] = row->chars[j];
+        }
+    }
+    row->render[idx] = '\0';
+    row->rsize = idx;
+}
+
 void editorAppendRow(char *s, size_t len)
 {
     E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
@@ -266,12 +334,20 @@ void editorAppendRow(char *s, size_t len)
     E.row[at].chars = malloc(len + 1);
     memcpy(E.row[at].chars, s, len);
     E.row[at].chars[len] = '\0';
+
+    E.row[at].rsize = 0;
+    E.row[at].render = NULL;
+    editorUpdateRow(&E.row[at]);
+
     E.numrows++;
 }
 
 /*** file i/o ***/
 void editorOpen(char *filename)
 {
+    free(E.filename);
+    E.filename = strdup(filename);
+
     FILE *fp = fopen(filename, "r");
     if (!fp)
     {
@@ -324,6 +400,11 @@ void abFree(struct abuf *ab)
 /*** output ***/
 void editorScroll()
 {
+    E.rx = 0;
+    if (E.cy < E.numrows)
+    {
+        E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+    }
     if (E.cy < E.rowoff)
     {
         E.rowoff = E.cy;
@@ -331,6 +412,14 @@ void editorScroll()
     if (E.cy >= E.rowoff + E.screenrows)
     {
         E.rowoff = E.cy - E.screenrows + 1;
+    }
+    if (E.rx < E.coloff)
+    {
+        E.coloff = E.rx;
+    }
+    if (E.rx >= E.coloff + E.screencols)
+    {
+        E.coloff = E.rx - E.screencols + 1;
     }
 }
 
@@ -369,19 +458,62 @@ void editorDrawRows(struct abuf *ab)
         }
         else
         {
-            int len = E.row[filerow].size;
+            int len = E.row[filerow].rsize - E.coloff;
+            if (len < 0)
+                len = 0;
             if (len > E.screencols)
                 len = E.screencols;
-            abAppend(ab, E.row[filerow].chars, len);
+            abAppend(ab, &E.row[filerow].render[E.coloff], len);
         }
 
         // 擦除当前行中的部分内容
         abAppend(ab, "\x1b[K", 3);
-        if (y < E.screenrows - 1)
+        abAppend(ab, "\r\n", 2);
+    }
+}
+
+void editorDrawStatusBar(struct abuf *ab)
+{
+    abAppend(ab, "\x1b[7m", 4);
+    char status[80], rstatus[80];
+
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines",
+                       E.filename ? E.filename : "[No Name]", E.numrows);
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
+
+    if (len > E.screencols)
+        len = E.screencols;
+    abAppend(ab, status, len);
+
+    while (len < E.screencols)
+    {
+        if (E.screencols - len == rlen)
         {
-            abAppend(ab, "\r\n", 2);
+            abAppend(ab, rstatus, rlen);
+            break;
+        }
+        else
+        {
+            abAppend(ab, " ", 1);
+            len++;
         }
     }
+    // 使后续文本以多种可能的属性显示，包括加粗（ 1 ）、下划线（ 4 ）、闪烁（ 5 ）和反色（ 7 ）
+    abAppend(ab, "\x1b[m", 3);
+    abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf *ab)
+{
+    abAppend(ab, "\x1b[K", 3);
+    int msglen = strlen(E.statusmsg);
+    if (msglen > E.screencols)
+        msglen = E.screencols;
+    
+    // 这个时间控制有点奇妙。如果消息时间戳距离当前时间超过5秒，则显示消息，否则不显示。
+    // 5 秒后按下任意键，该信息便会消失。请注意，我们仅在每次按键后刷新屏幕。
+    if (msglen && time(NULL) - E.statusmsg_time < 5)
+        abAppend(ab, E.statusmsg, msglen);
 }
 
 void editorRefreshScreen()
@@ -398,12 +530,16 @@ void editorRefreshScreen()
 
     // 3. 绘制所有文本行和编辑器界面元素到缓冲区
     editorDrawRows(&ab);
+    editorDrawStatusBar(&ab);
+    editorDrawMessageBar(&ab);
 
     /* 4. 准备光标定位转义序列：
        - 终端坐标系从(1,1)开始，编辑器内部从(0,0)存储
        - 生成类似\e[24;80H的字符串定位光标 */
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, E.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH",
+             (E.cy - E.rowoff) + 1,
+             (E.rx - E.coloff) + 1);
     abAppend(&ab, buf, strlen(buf));
 
     // 5. 重新显示光标
@@ -414,9 +550,19 @@ void editorRefreshScreen()
     abFree(&ab);
 }
 
+void editorSetStatusMessage(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+    va_end(ap);
+    E.statusmsg_time = time(NULL);
+}
+
 /*** input ***/
 void editorMoveCursor(int key)
 {
+    erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
     switch (key)
     {
     case ARROW_LEFT:
@@ -424,11 +570,21 @@ void editorMoveCursor(int key)
         {
             E.cx--;
         }
+        else if (E.cy > 0)
+        {
+            E.cy--;
+            E.cx = E.row[E.cy].size;
+        }
         break;
     case ARROW_RIGHT:
-        if (E.cx != E.screencols - 1)
+        if (row && E.cx < row->size)
         {
             E.cx++;
+        }
+        else if (row && E.cx == row->size)
+        {
+            E.cy++;
+            E.cx = 0;
         }
         break;
     case ARROW_UP:
@@ -443,6 +599,12 @@ void editorMoveCursor(int key)
             E.cy++;
         }
         break;
+    }
+    row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+    int rowlen = row ? row->size : 0;
+    if (E.cx > rowlen)
+    {
+        E.cx = rowlen;
     }
 }
 
@@ -462,12 +624,26 @@ void editorProcessKeypress()
         E.cx = 0;
         break;
     case END_KEY:
-        E.cx = E.screencols - 1;
+        if (E.cy < E.numrows)
+        {
+            E.cx = E.row[E.cy].size;
+        }
         break;
 
     case PAGE_UP:
     case PAGE_DOWN:
     {
+        if (c == PAGE_UP)
+        {
+            E.cy = E.rowoff;
+        }
+        else if (c == PAGE_DOWN)
+        {
+            E.cy = E.rowoff + E.screenrows - 1;
+            if (E.cy > E.numrows)
+                E.cy = E.numrows;
+        }
+
         int times = E.screenrows;
         while (times--)
             editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -488,12 +664,18 @@ void initEditor()
 {
     E.cx = 0;
     E.cy = 0;
+    E.rx = 0;
     E.rowoff = 0;
+    E.coloff = 0;
     E.numrows = 0;
     E.row = NULL;
+    E.filename = NULL;
+    E.statusmsg[0] = '\0';
+    E.statusmsg_time = 0;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1)
         die("getWindowSize");
+    E.screenrows -= 2;
 }
 
 int main(int argc, char *argv[])
@@ -507,6 +689,8 @@ int main(int argc, char *argv[])
     {
         editorOpen(argv[1]);
     }
+
+    editorSetStatusMessage("HELP: Ctrl-Q = quit");
 
     while (1)
     {
