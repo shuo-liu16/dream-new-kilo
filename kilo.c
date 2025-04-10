@@ -26,14 +26,19 @@
     g. Backspacing at the start of a line
 
     f. (flag) The enter key 逻辑比较绕，需要仔细考虑
-    e. (flag) Save as.. 
-    很奇妙，在没有建立文件前就能输入，输出。可能和缓冲区有点关系(原因是有个全局变量E，其能够存储文件内容) 
-
+    e. (flag) Save as..
+    很奇妙，在没有建立文件前就能输入，输出。可能和缓冲区有点关系(原因是有个全局变量E，其能够存储文件内容)
+6. Implementing search
+    a. Implement simple search
+    b. Implement incremental search(多次搜索)
+    c. Restore cursor position when search is canceled
+    d. Search forward and backward(多目标查询)
 
 BUG-TODO:
     1. 光标位置不准确，原因未知
     2. 有乱码情况
     3. 有行列数偏差情况，会在按下方向键时提前换行（可能是当前行列数不准确，唉，真烦）[好像是测试文件的问题，copy]
+    4. 关于光标位置，使用全局 cx cy，仅在渲染时进行 rx ry 的映射
 */
 
 /*** includes ***/
@@ -123,7 +128,7 @@ struct editorConfig E;
 /*** prototypes ***/
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
 /*** terminal ***/
 void die(const char *s)
@@ -313,6 +318,21 @@ int editorRowCxToRx(erow *row, int cx)
         rx++;
     }
     return rx;
+}
+
+int editorRowRxToCx(erow *row, int rx)
+{
+    int cur_rx = 0;
+    int cx = 0;
+    for (cx = 0; cx < row->size; cx++)
+    {
+        if (row->chars[cx] == '\t')
+            cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+        cur_rx++;
+        if (cur_rx > rx)
+            return cx;
+    }
+    return cx;
 }
 
 void editorUpdateRow(erow *row)
@@ -535,7 +555,7 @@ void editorSave()
 {
     if (E.filename == NULL)
     {
-        E.filename = editorPrompt("Save as: %s");
+        E.filename = editorPrompt("Save as: %s", NULL);
         if (E.filename == NULL)
         {
             editorSetStatusMessage("Save aborted");
@@ -567,6 +587,87 @@ void editorSave()
 
     free(buf);
     editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+/*** find ***/
+void editorFindCallback(char *query, int key)
+{
+    // 上一个匹配项所在位置
+    static int last_match = -1;
+    static int direction = 1;
+
+    if (key == '\r' || key == '\x1b')
+    {
+        last_match = -1;
+        direction = 1;
+        return;
+    }
+    else if (key == ARROW_RIGHT || key == ARROW_DOWN)
+    {
+        direction = 1;
+    }
+    else if (key == ARROW_LEFT || key == ARROW_UP)
+    {
+        direction = -1;
+    }
+    else
+    {
+        last_match = -1;
+        direction = 1;
+        return;
+    }
+
+    if (last_match == -1)
+    {
+        direction = 1;
+    }
+    int current = last_match;
+    int i;
+    for (i = 0; i < E.numrows; i++)
+    {
+        current += direction;
+        if (current == -1)
+        {
+            current = E.numrows - 1;
+        }
+        else if (current == E.numrows)
+        {
+            current = 0;
+        }
+
+        erow *row = &E.row[current];
+        char *match = strstr(row->render, query);
+        if (match)
+        {
+            last_match = current;
+            E.cy = current;
+            E.cx = editorRowRxToCx(row, match - row->render);
+            // if E.cy < E.rowoff: E.rowoff = E.cy;
+            E.rowoff = E.numrows;
+            break;
+        }
+    }
+}
+
+void editorFind()
+{
+    int saved_cx = E.cx;
+    int saved_cy = E.cy;
+    int saved_coloff = E.coloff;
+    int saved_rowoff = E.rowoff;
+    char *query = editorPrompt("Search: %s (Use ESC/Arrows/Enter)",
+                               editorFindCallback);
+    if (query)
+    {
+        free(query);
+    }
+    else
+    {
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.coloff = saved_coloff;
+        E.rowoff = saved_rowoff;
+    }
 }
 
 /*** append buffer ***/
@@ -759,7 +860,7 @@ void editorSetStatusMessage(const char *fmt, ...)
 
 /*** input ***/
 // 返回用户输入的字符
-char *editorPrompt(char *prompt)
+char *editorPrompt(char *prompt, void (*callback)(char *, int))
 {
     size_t bufsize = 128;
     char *buf = malloc(bufsize);
@@ -781,6 +882,8 @@ char *editorPrompt(char *prompt)
         else if (c == '\x1b')
         {
             editorSetStatusMessage("");
+            if (callback)
+                callback(buf, c);
             free(buf);
             return NULL;
         }
@@ -789,6 +892,8 @@ char *editorPrompt(char *prompt)
             if (buflen != 0)
             {
                 editorSetStatusMessage("");
+                if (callback)
+                    callback(buf, c);
                 return buf;
             }
         }
@@ -802,6 +907,8 @@ char *editorPrompt(char *prompt)
             buf[buflen++] = c;
             buf[buflen] = '\0';
         }
+        if (callback)
+            callback(buf, c);
     }
 }
 
@@ -894,6 +1001,10 @@ void editorProcessKeypress()
         }
         break;
 
+    case CTRL_KEY('f'):
+        editorFind();
+        break;
+
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
@@ -968,7 +1079,7 @@ int main(int argc, char *argv[])
         editorOpen(argv[1]);
     }
 
-    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
+    editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
     while (1)
     {
