@@ -1,4 +1,14 @@
 /*
+ * Kilo -- A very simple editor in less than 1-kilo lines of code (as counted
+ * by "cloc"). Does not depend on libcurses, directly emits VT100
+ * escapes on the terminal.
+ *
+ * Copyright (C) 2016 Salvatore Sanfilippo <antirez at gmail dot com>
+ *
+ * Modified by Dream in 2025
+ */
+
+/*
 1. 首先你得先有一个主循环
 2. 在开始时，使终端从规范模式(canonical mode/cooked mode)进入到原始模式(raw mode)
     a.turn off echo
